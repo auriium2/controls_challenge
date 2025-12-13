@@ -359,3 +359,171 @@ def run_simulation(model, init_action_hist, init_lataccel_hist, init_exo_hist, e
     step_fn = make_simulation_step(model)
     _, outputs = lax.scan(step_fn, init_carry, (exo_data, actions))
     return outputs
+
+
+def make_pid_simulation_step(model, p=0.195, i=0.100, d=-0.053):
+    """Create a simulation step function with PID controller."""
+
+    def simulation_step(carry, inputs):
+        """Single simulation step with PID control."""
+        action_hist, lataccel_hist, exo_hist, current_lataccel, error_integral, prev_error = carry
+        exo_row = inputs  # exo_row: [batch, 4] = (roll, v, a, target)
+        
+        target = exo_row[:, 3]  # target lataccel
+        
+        # PID control
+        error = target - current_lataccel
+        error_integral_new = error_integral + error
+        error_diff = error - prev_error
+        
+        action = p * error + i * error_integral_new + d * error_diff
+        action = jnp.clip(action, -2, 2)
+
+        # Build states [batch, 20, 4]: (action, roll, v, a)
+        states = jnp.concatenate([
+            action_hist[:, :, None],
+            exo_hist,
+        ], axis=-1)
+
+        # Tokenize lataccel history
+        tokens = encode(lataccel_hist)
+
+        # Forward pass
+        logits = model(states, tokens)
+        next_token = jnp.argmax(logits[:, -1, :], axis=-1)
+        next_lataccel = decode(next_token)
+
+        # Rate limit
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update histories
+        action_hist = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+        lataccel_hist = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist, lataccel_hist, exo_hist, next_lataccel, error_integral_new, error)
+        output = jnp.stack([next_lataccel, action, exo_row[:, 0], exo_row[:, 1], exo_row[:, 2], exo_row[:, 3]], axis=-1)
+        return new_carry, output
+
+    return simulation_step
+
+
+def run_simulation_pid(model, init_action_hist, init_lataccel_hist, init_exo_hist, exo_data,
+                       p=0.195, i=0.100, d=-0.053):
+    """
+    Run batched simulation with PID controller.
+
+    Args:
+        model: TinyPhysicsModel
+        init_action_hist: [batch, 20] - initial action history
+        init_lataccel_hist: [batch, 20] - initial lataccel history
+        init_exo_hist: [batch, 20, 3] - initial exo history (roll, v, a)
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        p, i, d: PID gains
+
+    Returns:
+        outputs: [n_steps, batch, 6] (lataccel, action, roll, v, a, target)
+    """
+    batch_size = init_action_hist.shape[0]
+    init_error_integral = jnp.zeros(batch_size)
+    init_prev_error = jnp.zeros(batch_size)
+    
+    init_carry = (
+        init_action_hist, 
+        init_lataccel_hist, 
+        init_exo_hist, 
+        init_lataccel_hist[:, -1],
+        init_error_integral,
+        init_prev_error
+    )
+    step_fn = make_pid_simulation_step(model, p, i, d)
+    _, outputs = lax.scan(step_fn, init_carry, exo_data)
+    return outputs
+
+
+def make_noisy_pid_simulation_step(model, key, p=0.195, i=0.100, d=-0.053, noise_std=0.3):
+    """Create a simulation step function with noisy PID controller."""
+    
+    # Pre-generate all random keys we'll need
+    # This is a workaround since we can't easily pass RNG through scan
+    
+    def simulation_step(carry, inputs):
+        """Single simulation step with noisy PID control."""
+        action_hist, lataccel_hist, exo_hist, current_lataccel, error_integral, prev_error, step_idx = carry
+        exo_row, noise = inputs  # exo_row: [batch, 4], noise: [batch]
+        
+        target = exo_row[:, 3]
+        
+        # PID control with noise
+        error = target - current_lataccel
+        error_integral_new = error_integral + error
+        error_diff = error - prev_error
+        
+        action = p * error + i * error_integral_new + d * error_diff
+        action = action + noise  # Add exploration noise
+        action = jnp.clip(action, -2, 2)
+
+        # Build states
+        states = jnp.concatenate([
+            action_hist[:, :, None],
+            exo_hist,
+        ], axis=-1)
+
+        tokens = encode(lataccel_hist)
+
+        logits = model(states, tokens)
+        next_token = jnp.argmax(logits[:, -1, :], axis=-1)
+        next_lataccel = decode(next_token)
+
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        action_hist = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+        lataccel_hist = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist, lataccel_hist, exo_hist, next_lataccel, error_integral_new, error, step_idx + 1)
+        output = jnp.stack([next_lataccel, action, exo_row[:, 0], exo_row[:, 1], exo_row[:, 2], exo_row[:, 3]], axis=-1)
+        return new_carry, output
+
+    return simulation_step
+
+
+def run_simulation_noisy_pid(model, init_action_hist, init_lataccel_hist, init_exo_hist, exo_data,
+                              key, p=0.195, i=0.100, d=-0.053, noise_std=0.3):
+    """
+    Run batched simulation with noisy PID controller for exploration.
+
+    Args:
+        model: TinyPhysicsModel
+        init_action_hist: [batch, 20]
+        init_lataccel_hist: [batch, 20]
+        init_exo_hist: [batch, 20, 3]
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        key: JAX random key
+        p, i, d: PID gains
+        noise_std: standard deviation of exploration noise
+
+    Returns:
+        outputs: [n_steps, batch, 6] (lataccel, action, roll, v, a, target)
+    """
+    batch_size = init_action_hist.shape[0]
+    n_steps = exo_data.shape[0]
+    
+    init_error_integral = jnp.zeros(batch_size)
+    init_prev_error = jnp.zeros(batch_size)
+    
+    # Pre-generate noise for all steps
+    noise = jax.random.normal(key, (n_steps, batch_size)) * noise_std
+    
+    init_carry = (
+        init_action_hist, 
+        init_lataccel_hist, 
+        init_exo_hist, 
+        init_lataccel_hist[:, -1],
+        init_error_integral,
+        init_prev_error,
+        0  # step index
+    )
+    step_fn = make_noisy_pid_simulation_step(model, key, p, i, d, noise_std)
+    _, outputs = lax.scan(step_fn, init_carry, (exo_data, noise))
+    return outputs
