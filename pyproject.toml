@@ -1,0 +1,25 @@
+[project]
+name = "controls-challenge"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "equinox>=0.13.2",
+    "jax>=0.4.26,<0.5",
+    "jax-metal==0.1.0",
+    "jaxlib>=0.4.26,<0.5",
+    "mlx>=0.30.0",
+    "modal>=1.2.5",
+    "numpy>=2.3.4",
+    "onnx2torch>=1.5.15",
+    "onnxruntime>=1.23.2",
+    "pygame>=2.6.1",
+    "pykoopman>=1.0.5",
+    "pytest>=9.0.2",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.16.3",
+    "seaborn>=0.13.2",
+    "torch>=2.9.0",
+    "tqdm>=4.67.1",
+]

@@ -1,0 +1,388 @@
+"""
+Comprehensive parity tests between tinyphysics_eqx and original ONNX model.
+
+These tests verify that our JAX/Equinox implementation produces identical
+results to the original ONNX TinyPhysics model.
+"""
+import os
+import numpy as np
+import pandas as pd
+import pytest
+import onnxruntime as ort
+
+os.environ['JAX_PLATFORMS'] = 'cpu'
+
+import jax.numpy as jnp
+from tinyphysics_eqx import (
+    create_model,
+    run_simulation,
+    CONTEXT_LENGTH,
+    BINS,
+    MAX_ACC_DELTA,
+    encode,
+    decode,
+)
+
+ACC_G = 9.81
+
+
+@pytest.fixture(scope="module")
+def onnx_session():
+    """Load ONNX model once for all tests."""
+    return ort.InferenceSession('models/tinyphysics.onnx')
+
+
+@pytest.fixture(scope="module")
+def eqx_model():
+    """Load Equinox model once for all tests."""
+    return create_model('models/tinyphysics.onnx')
+
+
+@pytest.fixture(scope="module")
+def bins():
+    """Tokenization bins."""
+    return np.linspace(-5, 5, 1024)
+
+
+def load_csv_data(file_path):
+    """Load and process a CSV file like the original TinyPhysics."""
+    df = pd.read_csv(file_path)
+    return {
+        'roll_lataccel': np.sin(df['roll'].values) * ACC_G,
+        'v_ego': df['vEgo'].values,
+        'a_ego': df['aEgo'].values,
+        'target_lataccel': df['targetLateralAcceleration'].values,
+        'steer_command': -df['steerCommand'].values,
+    }
+
+
+def build_model_input(data, step, bins):
+    """Build model input at a given step."""
+    actions = data['steer_command'][step - CONTEXT_LENGTH:step]
+    raw_states = np.column_stack([
+        data['roll_lataccel'][step - CONTEXT_LENGTH:step],
+        data['v_ego'][step - CONTEXT_LENGTH:step],
+        data['a_ego'][step - CONTEXT_LENGTH:step]
+    ])
+    states = np.column_stack([actions, raw_states])
+    states = np.expand_dims(states, 0).astype(np.float32)
+
+    lataccel_history = data['target_lataccel'][step - CONTEXT_LENGTH:step]
+    tokens = np.digitize(np.clip(lataccel_history, -5, 5), bins, right=True)
+    tokens = np.expand_dims(tokens, 0).astype(np.int64)
+
+    return states, tokens
+
+
+class TestForwardPassParity:
+    """Test that forward passes produce identical results."""
+
+    @pytest.mark.parametrize("file_idx", [0, 100, 500, 1000, 5000, 10000])
+    @pytest.mark.parametrize("step", [20, 30, 50, 70, 99])
+    def test_forward_pass_on_real_data(self, onnx_session, eqx_model, bins, file_idx, step):
+        """Test forward pass parity on real driving data."""
+        file_path = f'data/{file_idx:05d}.csv'
+        if not os.path.exists(file_path):
+            pytest.skip(f"Data file {file_path} not found")
+
+        data = load_csv_data(file_path)
+        if step >= len(data['roll_lataccel']):
+            pytest.skip(f"Step {step} exceeds data length")
+
+        states, tokens = build_model_input(data, step, bins)
+
+        # Run both models
+        onnx_logits = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+        eqx_logits = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        # Compare logits
+        max_diff = np.abs(onnx_logits - eqx_logits).max()
+        assert max_diff < 1e-3, f"Logit diff too large: {max_diff}"
+
+        # Compare predicted tokens
+        onnx_token = onnx_logits[0, -1, :].argmax()
+        eqx_token = eqx_logits[0, -1, :].argmax()
+        assert onnx_token == eqx_token, f"Token mismatch: ONNX={onnx_token}, EQX={eqx_token}"
+
+
+class TestFullRolloutParity:
+    """Test that full simulation rollouts match."""
+
+    def run_onnx_rollout(self, onnx_session, data, horizon, actions, bins):
+        """Run original ONNX-style rollout step by step."""
+        action_history = list(data['steer_command'][:CONTEXT_LENGTH])
+        lataccel_history = list(data['target_lataccel'][:CONTEXT_LENGTH])
+        current_lataccel = lataccel_history[-1]
+
+        preds = []
+
+        for i, step in enumerate(range(CONTEXT_LENGTH, CONTEXT_LENGTH + horizon)):
+            # Build input
+            actions_hist = action_history[-CONTEXT_LENGTH:]
+            raw_states = np.column_stack([
+                data['roll_lataccel'][step - CONTEXT_LENGTH:step],
+                data['v_ego'][step - CONTEXT_LENGTH:step],
+                data['a_ego'][step - CONTEXT_LENGTH:step]
+            ])
+            states = np.column_stack([actions_hist, raw_states])
+            states = np.expand_dims(states, 0).astype(np.float32)
+
+            tokens = np.digitize(
+                np.clip(lataccel_history[-CONTEXT_LENGTH:], -5, 5), bins, right=True
+            )
+            tokens = np.expand_dims(tokens, 0).astype(np.int64)
+
+            # Forward pass
+            logits = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+            next_token = logits[0, -1, :].argmax()
+            next_lataccel = bins[next_token]
+            next_lataccel = np.clip(
+                next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA
+            )
+
+            preds.append(next_lataccel)
+
+            # Update histories
+            action_history.append(actions[i])
+            lataccel_history.append(next_lataccel)
+            current_lataccel = next_lataccel
+
+        return np.array(preds)
+
+    def run_eqx_rollout(self, eqx_model, data, horizon, actions):
+        """Run Equinox batched rollout."""
+        init_action_hist = jnp.array(data['steer_command'][:CONTEXT_LENGTH][None, :])
+        init_lataccel_hist = jnp.array(data['target_lataccel'][:CONTEXT_LENGTH][None, :])
+        init_exo_hist = jnp.array(np.stack([
+            data['roll_lataccel'][:CONTEXT_LENGTH],
+            data['v_ego'][:CONTEXT_LENGTH],
+            data['a_ego'][:CONTEXT_LENGTH],
+        ], axis=-1)[None, :, :])
+
+        exo_start = CONTEXT_LENGTH
+        exo_end = exo_start + horizon
+        exo_data = jnp.array(np.stack([
+            data['roll_lataccel'][exo_start:exo_end],
+            data['v_ego'][exo_start:exo_end],
+            data['a_ego'][exo_start:exo_end],
+            data['target_lataccel'][exo_start:exo_end],
+        ], axis=-1)[:, None, :])
+
+        actions_jax = jnp.array(actions[:, None])
+
+        outputs = run_simulation(
+            eqx_model, init_action_hist, init_lataccel_hist, init_exo_hist, exo_data, actions_jax
+        )
+        return np.array(outputs[:, 0, 0])
+
+    @pytest.mark.parametrize("file_idx", [0, 500, 1000, 5000])
+    def test_rollout_with_real_actions(self, onnx_session, eqx_model, bins, file_idx):
+        """Test rollout parity using real steer commands."""
+        file_path = f'data/{file_idx:05d}.csv'
+        if not os.path.exists(file_path):
+            pytest.skip(f"Data file {file_path} not found")
+
+        data = load_csv_data(file_path)
+        horizon = 79  # Steps 20-99 (before steer_command becomes NaN)
+
+        actions = data['steer_command'][CONTEXT_LENGTH:CONTEXT_LENGTH + horizon]
+
+        onnx_preds = self.run_onnx_rollout(onnx_session, data, horizon, actions, bins)
+        eqx_preds = self.run_eqx_rollout(eqx_model, data, horizon, actions)
+
+        # All steps should match
+        assert np.allclose(onnx_preds, eqx_preds, rtol=1e-4), \
+            f"Rollout mismatch: max_diff={np.abs(onnx_preds - eqx_preds).max()}"
+
+    @pytest.mark.parametrize("file_idx", [0, 500, 1000, 5000])
+    @pytest.mark.parametrize("seed", [42, 123, 456])
+    def test_rollout_with_random_actions(self, onnx_session, eqx_model, bins, file_idx, seed):
+        """Test rollout parity using random actions."""
+        file_path = f'data/{file_idx:05d}.csv'
+        if not os.path.exists(file_path):
+            pytest.skip(f"Data file {file_path} not found")
+
+        data = load_csv_data(file_path)
+        horizon = 79
+
+        np.random.seed(seed)
+        actions = np.random.uniform(-2, 2, horizon)
+
+        onnx_preds = self.run_onnx_rollout(onnx_session, data, horizon, actions, bins)
+        eqx_preds = self.run_eqx_rollout(eqx_model, data, horizon, actions)
+
+        assert np.allclose(onnx_preds, eqx_preds, rtol=1e-4), \
+            f"Rollout mismatch: max_diff={np.abs(onnx_preds - eqx_preds).max()}"
+
+
+class TestEdgeCases:
+    """Test edge cases and boundary conditions."""
+
+    @pytest.mark.parametrize("action_val", [-2.0, -1.0, 0.0, 1.0, 2.0, -10.0, 10.0])
+    def test_extreme_action_values(self, onnx_session, eqx_model, action_val):
+        """Test with extreme action values."""
+        states = np.zeros((1, CONTEXT_LENGTH, 4), dtype=np.float32)
+        states[:, :, 0] = action_val
+        states[:, :, 2] = 30.0  # v_ego
+        tokens = np.full((1, CONTEXT_LENGTH), 512, dtype=np.int64)
+
+        onnx_out = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+        eqx_out = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        onnx_token = onnx_out[0, -1, :].argmax()
+        eqx_token = eqx_out[0, -1, :].argmax()
+        assert onnx_token == eqx_token
+
+    @pytest.mark.parametrize("roll,v,a", [
+        (-1.5, 30, 0),
+        (1.5, 30, 0),
+        (0, 0, 0),
+        (0, 50, 0),
+        (0, 30, -10),
+        (0, 30, 10),
+        (1.5, 50, 10),
+    ])
+    def test_extreme_exogenous_values(self, onnx_session, eqx_model, roll, v, a):
+        """Test with extreme exogenous values."""
+        states = np.zeros((1, CONTEXT_LENGTH, 4), dtype=np.float32)
+        states[:, :, 1] = roll
+        states[:, :, 2] = v
+        states[:, :, 3] = a
+        tokens = np.full((1, CONTEXT_LENGTH), 512, dtype=np.int64)
+
+        onnx_out = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+        eqx_out = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        onnx_token = onnx_out[0, -1, :].argmax()
+        eqx_token = eqx_out[0, -1, :].argmax()
+        assert onnx_token == eqx_token
+
+    @pytest.mark.parametrize("token_val", [0, 1, 511, 512, 513, 1022, 1023])
+    def test_extreme_token_values(self, onnx_session, eqx_model, token_val):
+        """Test with extreme token values (lataccel history)."""
+        states = np.zeros((1, CONTEXT_LENGTH, 4), dtype=np.float32)
+        states[:, :, 2] = 30.0
+        tokens = np.full((1, CONTEXT_LENGTH), token_val, dtype=np.int64)
+
+        onnx_out = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+        eqx_out = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        onnx_token = onnx_out[0, -1, :].argmax()
+        eqx_token = eqx_out[0, -1, :].argmax()
+        assert onnx_token == eqx_token
+
+    def test_varying_history(self, onnx_session, eqx_model):
+        """Test with varying history values."""
+        states = np.zeros((1, CONTEXT_LENGTH, 4), dtype=np.float32)
+        states[0, :, 0] = np.linspace(-2, 2, CONTEXT_LENGTH)
+        states[0, :, 1] = np.linspace(-0.5, 0.5, CONTEXT_LENGTH)
+        states[0, :, 2] = np.linspace(20, 40, CONTEXT_LENGTH)
+        states[0, :, 3] = np.linspace(-1, 1, CONTEXT_LENGTH)
+        tokens = np.linspace(400, 600, CONTEXT_LENGTH).astype(np.int64).reshape(1, -1)
+
+        onnx_out = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+        eqx_out = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        onnx_token = onnx_out[0, -1, :].argmax()
+        eqx_token = eqx_out[0, -1, :].argmax()
+        assert onnx_token == eqx_token
+
+    def test_oscillating_history(self, onnx_session, eqx_model):
+        """Test with oscillating history values."""
+        states = np.zeros((1, CONTEXT_LENGTH, 4), dtype=np.float32)
+        states[0, :, 0] = np.sin(np.linspace(0, 4 * np.pi, CONTEXT_LENGTH)) * 2
+        states[0, :, 2] = 30.0
+        tokens = (np.sin(np.linspace(0, 2 * np.pi, CONTEXT_LENGTH)) * 200 + 512).astype(np.int64)
+        tokens = tokens.reshape(1, -1)
+
+        onnx_out = onnx_session.run(None, {'states': states, 'tokens': tokens})[0]
+        eqx_out = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        onnx_token = onnx_out[0, -1, :].argmax()
+        eqx_token = eqx_out[0, -1, :].argmax()
+        assert onnx_token == eqx_token
+
+
+class TestTokenization:
+    """Test tokenization parity."""
+
+    @pytest.mark.parametrize("value", [
+        -5.0, -4.99, -2.5, -0.01, 0.0, 0.01, 2.5, 4.99, 5.0, -10.0, 10.0
+    ])
+    def test_encode_parity(self, bins, value):
+        """Test that encoding matches numpy digitize."""
+        np_token = np.digitize(np.clip(value, -5, 5), bins, right=True)
+        jax_token = int(encode(jnp.array(value)))
+        assert np_token == jax_token, f"Encode mismatch for {value}: np={np_token}, jax={jax_token}"
+
+    @pytest.mark.parametrize("token", [0, 1, 256, 511, 512, 513, 768, 1022, 1023])
+    def test_decode_parity(self, bins, token):
+        """Test that decoding matches numpy indexing."""
+        np_val = bins[token]
+        jax_val = float(decode(jnp.array(token)))
+        assert np.isclose(np_val, jax_val), f"Decode mismatch for {token}: np={np_val}, jax={jax_val}"
+
+    def test_encode_decode_roundtrip(self, bins):
+        """Test encode-decode roundtrip within quantization error."""
+        test_values = np.linspace(-5, 5, 100)
+        for val in test_values:
+            token = int(encode(jnp.array(val)))
+            decoded = float(decode(jnp.array(token)))
+            # Should be within one bin width (with small tolerance for float precision)
+            bin_width = 10.0 / 1024
+            assert abs(val - decoded) <= bin_width * 1.01, f"Roundtrip error for {val}: got {decoded}"
+
+
+class TestBatchedOperations:
+    """Test batched operations produce same results as sequential."""
+
+    def test_batched_forward_matches_sequential(self, onnx_session, eqx_model):
+        """Test that batched forward pass matches sequential calls."""
+        np.random.seed(42)
+        batch_size = 8
+
+        # Generate random inputs
+        states = np.random.randn(batch_size, CONTEXT_LENGTH, 4).astype(np.float32)
+        states[:, :, 2] = np.abs(states[:, :, 2]) * 20 + 10  # Positive v_ego
+        tokens = np.random.randint(0, 1024, (batch_size, CONTEXT_LENGTH)).astype(np.int64)
+
+        # Batched call
+        eqx_batched = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        # Sequential calls
+        for i in range(batch_size):
+            eqx_single = np.array(eqx_model(
+                jnp.array(states[i:i+1]), jnp.array(tokens[i:i+1])
+            ))
+            # Small floating point differences are acceptable
+            assert np.allclose(eqx_batched[i], eqx_single[0], rtol=1e-4, atol=1e-5), \
+                f"Batch/single mismatch at index {i}"
+            # But predicted tokens must match exactly
+            assert eqx_batched[i, -1, :].argmax() == eqx_single[0, -1, :].argmax(), \
+                f"Token mismatch at index {i}"
+
+    def test_batched_vs_onnx_sequential(self, onnx_session, eqx_model):
+        """Test batched Equinox matches sequential ONNX calls."""
+        np.random.seed(123)
+        batch_size = 8
+
+        states = np.random.randn(batch_size, CONTEXT_LENGTH, 4).astype(np.float32)
+        states[:, :, 2] = np.abs(states[:, :, 2]) * 20 + 10
+        tokens = np.random.randint(0, 1024, (batch_size, CONTEXT_LENGTH)).astype(np.int64)
+
+        # Batched Equinox
+        eqx_out = np.array(eqx_model(jnp.array(states), jnp.array(tokens)))
+
+        # Sequential ONNX
+        for i in range(batch_size):
+            onnx_out = onnx_session.run(None, {
+                'states': states[i:i+1],
+                'tokens': tokens[i:i+1]
+            })[0]
+
+            max_diff = np.abs(onnx_out[0] - eqx_out[i]).max()
+            assert max_diff < 1e-3, f"Diff too large at index {i}: {max_diff}"
+
+            onnx_token = onnx_out[0, -1, :].argmax()
+            eqx_token = eqx_out[i, -1, :].argmax()
+            assert onnx_token == eqx_token, f"Token mismatch at {i}: {onnx_token} vs {eqx_token}"
