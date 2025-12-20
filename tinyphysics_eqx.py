@@ -8,7 +8,9 @@ import onnx
 import onnx.numpy_helper
 from typing import Dict, Tuple
 from functools import partial
+from jaxopt.projection import projection_simplex
 
+import common
 
 class TransformerBlock(eqx.Module):
     """Single transformer block with pre-norm architecture."""
@@ -287,6 +289,72 @@ def decode(token):
     """Decode token to lataccel."""
     return BINS[jnp.clip(token, 0, 1023)]
 
+def soft_decode(logits, temperature=1.0):
+    """Differentiable decoding: softmax weighted average of bin values.
+
+    Args:
+        logits: [batch, vocab_size] - raw logits from model
+        temperature: softmax temperature (lower = sharper, closer to argmax)
+
+    Returns:
+        [batch] - continuous lataccel values
+    """
+    probs = jax.nn.softmax(logits / temperature, axis=-1)
+    return jnp.sum(probs * BINS, axis=-1)
+
+
+def sparsemax_decode(logits, scale=10.0):
+    """Differentiable decoding using sparsemax.
+
+    Sparsemax projects onto the probability simplex, producing sparse outputs
+    that are often exactly one-hot (matching hard argmax) while still being
+    differentiable at the boundaries.
+
+    Args:
+        logits: [batch, vocab_size] - raw logits from model
+        scale: multiply logits by this factor before sparsemax (higher = sparser)
+
+    Returns:
+        [batch] - continuous lataccel values (often exactly matching hard decode)
+    """
+    # Scale logits to make sparsemax sparser (more likely to be one-hot)
+    scaled_logits = logits * scale
+    probs = jax.vmap(projection_simplex)(scaled_logits)
+    return jnp.sum(probs * BINS, axis=-1)
+
+
+def sparsemax_encode(value):
+    """Sparsemax-based soft encoding.
+
+    Creates sparse token probabilities based on distance to bins.
+    """
+    value = jnp.clip(value, -5, 5)
+    # Negative squared distance as logits
+    distances = -(value[..., None] - BINS) ** 2
+    # Apply sparsemax (projection onto simplex)
+    return jax.vmap(projection_simplex)(distances.reshape(-1, 1024)).reshape(value.shape + (1024,))
+
+
+def soft_encode(value, temperature=0.1):
+    """Differentiable encoding: soft one-hot based on distance to bins.
+
+    Creates a soft token representation that is differentiable w.r.t. value.
+    Uses a Gaussian-like kernel centered at the value's position in bin space.
+
+    Args:
+        value: [...] - continuous lataccel values
+        temperature: controls sharpness (lower = closer to hard encoding)
+
+    Returns:
+        [..., 1024] - soft token probabilities
+    """
+    value = jnp.clip(value, -5, 5)
+    # Distance from each bin
+    distances = (value[..., None] - BINS) ** 2  # [..., 1024]
+    # Soft assignment via negative squared distance
+    logits = -distances / (2 * temperature ** 2)
+    return jax.nn.softmax(logits, axis=-1)
+
 
 def make_simulation_step(model):
     """Create a simulation step function for use with lax.scan."""
@@ -361,6 +429,10 @@ def run_simulation(model, init_action_hist, init_lataccel_hist, init_exo_hist, e
     return outputs
 
 
+# ============================================================================
+# PID CONTROLLER SIMULATION
+# ============================================================================
+
 def make_pid_simulation_step(model, p=0.195, i=0.100, d=-0.053):
     """Create a simulation step function with PID controller."""
 
@@ -368,14 +440,14 @@ def make_pid_simulation_step(model, p=0.195, i=0.100, d=-0.053):
         """Single simulation step with PID control."""
         action_hist, lataccel_hist, exo_hist, current_lataccel, error_integral, prev_error = carry
         exo_row = inputs  # exo_row: [batch, 4] = (roll, v, a, target)
-        
+
         target = exo_row[:, 3]  # target lataccel
-        
+
         # PID control
         error = target - current_lataccel
         error_integral_new = error_integral + error
         error_diff = error - prev_error
-        
+
         action = p * error + i * error_integral_new + d * error_diff
         action = jnp.clip(action, -2, 2)
 
@@ -427,11 +499,11 @@ def run_simulation_pid(model, init_action_hist, init_lataccel_hist, init_exo_his
     batch_size = init_action_hist.shape[0]
     init_error_integral = jnp.zeros(batch_size)
     init_prev_error = jnp.zeros(batch_size)
-    
+
     init_carry = (
-        init_action_hist, 
-        init_lataccel_hist, 
-        init_exo_hist, 
+        init_action_hist,
+        init_lataccel_hist,
+        init_exo_hist,
         init_lataccel_hist[:, -1],
         init_error_integral,
         init_prev_error
@@ -441,24 +513,21 @@ def run_simulation_pid(model, init_action_hist, init_lataccel_hist, init_exo_his
     return outputs
 
 
-def make_noisy_pid_simulation_step(model, key, p=0.195, i=0.100, d=-0.053, noise_std=0.3):
+def make_noisy_pid_simulation_step(model, p=0.195, i=0.100, d=-0.053, noise_std=0.3):
     """Create a simulation step function with noisy PID controller."""
-    
-    # Pre-generate all random keys we'll need
-    # This is a workaround since we can't easily pass RNG through scan
-    
+
     def simulation_step(carry, inputs):
         """Single simulation step with noisy PID control."""
-        action_hist, lataccel_hist, exo_hist, current_lataccel, error_integral, prev_error, step_idx = carry
+        action_hist, lataccel_hist, exo_hist, current_lataccel, error_integral, prev_error = carry
         exo_row, noise = inputs  # exo_row: [batch, 4], noise: [batch]
-        
+
         target = exo_row[:, 3]
-        
+
         # PID control with noise
         error = target - current_lataccel
         error_integral_new = error_integral + error
         error_diff = error - prev_error
-        
+
         action = p * error + i * error_integral_new + d * error_diff
         action = action + noise  # Add exploration noise
         action = jnp.clip(action, -2, 2)
@@ -481,7 +550,7 @@ def make_noisy_pid_simulation_step(model, key, p=0.195, i=0.100, d=-0.053, noise
         exo_hist = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
         lataccel_hist = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
 
-        new_carry = (action_hist, lataccel_hist, exo_hist, next_lataccel, error_integral_new, error, step_idx + 1)
+        new_carry = (action_hist, lataccel_hist, exo_hist, next_lataccel, error_integral_new, error)
         output = jnp.stack([next_lataccel, action, exo_row[:, 0], exo_row[:, 1], exo_row[:, 2], exo_row[:, 3]], axis=-1)
         return new_carry, output
 
@@ -508,22 +577,758 @@ def run_simulation_noisy_pid(model, init_action_hist, init_lataccel_hist, init_e
     """
     batch_size = init_action_hist.shape[0]
     n_steps = exo_data.shape[0]
-    
+
     init_error_integral = jnp.zeros(batch_size)
     init_prev_error = jnp.zeros(batch_size)
-    
+
     # Pre-generate noise for all steps
     noise = jax.random.normal(key, (n_steps, batch_size)) * noise_std
-    
+
     init_carry = (
-        init_action_hist, 
-        init_lataccel_hist, 
-        init_exo_hist, 
+        init_action_hist,
+        init_lataccel_hist,
+        init_exo_hist,
         init_lataccel_hist[:, -1],
         init_error_integral,
         init_prev_error,
-        0  # step index
     )
-    step_fn = make_noisy_pid_simulation_step(model, key, p, i, d, noise_std)
+    step_fn = make_noisy_pid_simulation_step(model, p, i, d, noise_std)
     _, outputs = lax.scan(step_fn, init_carry, (exo_data, noise))
+    return outputs
+
+
+# ============================================================================
+# DIFFERENTIABLE SIMULATION (for training surrogate models)
+# ============================================================================
+
+def model_forward_soft(model, states, lataccel_hist, temperature=0.1):
+    """Forward pass with soft token embeddings (differentiable).
+
+    Instead of using integer tokens, we compute soft embeddings by
+    weighting the token embedding matrix by soft token probabilities.
+    """
+    B, T, _ = states.shape
+
+    # Soft encode lataccel history -> [batch, seq, 1024]
+    soft_tokens = soft_encode(lataccel_hist, temperature=temperature)
+
+    # Soft token embedding: weighted sum of embedding vectors
+    # token_embed.weight: [1024, 64], soft_tokens: [batch, seq, 1024]
+    token_emb = jnp.einsum('bsv,vd->bsd', soft_tokens, model.token_embed.weight)
+
+    # State embedding
+    state_emb = states @ model.state_proj.weight.T + model.state_proj.bias
+
+    # Concatenate and add position
+    x = jnp.concatenate([state_emb, token_emb], axis=-1)
+    x = x + model.pos_embed[:T]
+
+    # Causal mask
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+
+    # Transformer blocks
+    for block in model.blocks:
+        x = block(x, mask)
+
+    # Output
+    def ln(x, weight, bias, eps=1e-5):
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
+        return (x - mean) / jnp.sqrt(var + eps) * weight + bias
+
+    x = ln(x, model.ln_f.weight, model.ln_f.bias)
+    logits = x @ model.lm_head.weight.T
+
+    return logits
+
+
+def make_differentiable_step(model, temperature=0.1):
+    """Create a fully differentiable simulation step.
+
+    Uses soft encoding/decoding so gradients flow through the entire
+    recurrence, including the lataccel history.
+    """
+
+    def simulation_step(carry, inputs):
+        """Fully differentiable simulation step."""
+        action_hist, lataccel_hist, exo_hist, current_lataccel = carry
+        exo_row, action = inputs  # exo_row: [batch, 4], action: [batch]
+
+        # Build states [batch, 20, 4]: (action, roll, v, a)
+        states = jnp.concatenate([
+            action_hist[:, :, None],
+            exo_hist,
+        ], axis=-1)
+
+        # Forward pass with SOFT token embeddings (differentiable)
+        logits = model_forward_soft(model, states, lataccel_hist, temperature=temperature)
+
+        # DIFFERENTIABLE: use soft decode
+        next_lataccel = soft_decode(logits[:, -1, :], temperature=temperature)
+
+        # Rate limit
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update histories
+        action_hist = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+        lataccel_hist = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist, lataccel_hist, exo_hist, next_lataccel)
+        return new_carry, next_lataccel
+
+    return simulation_step
+
+
+def run_simulation_differentiable(model, init_action_hist, init_lataccel_hist, init_exo_hist,
+                                   exo_data, actions, temperature=0.1):
+    """
+    Run differentiable simulation - gradients flow through the entire rollout.
+
+    Args:
+        model: TinyPhysicsModel (frozen weights)
+        init_action_hist: [batch, 20]
+        init_lataccel_hist: [batch, 20]
+        init_exo_hist: [batch, 20, 3]
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        actions: [n_steps, batch]
+        temperature: softmax temperature for soft decoding
+
+    Returns:
+        lataccels: [n_steps, batch] - predicted lateral accelerations
+    """
+    init_carry = (init_action_hist, init_lataccel_hist, init_exo_hist, init_lataccel_hist[:, -1])
+    step_fn = make_differentiable_step(model, temperature=temperature)
+    _, lataccels = lax.scan(step_fn, init_carry, (exo_data, actions))
+    return lataccels
+
+
+# ============================================================================
+# STRAIGHT-THROUGH ESTIMATOR SIMULATION
+# Hard forward pass, soft backward pass for gradients
+# Uses custom_vjp to ensure forward pass is EXACTLY the same as hard simulation
+# ============================================================================
+
+def _decode_fwd(logits, temperature):
+    """Forward pass: exact hard decode."""
+    token = jnp.argmax(logits, axis=-1)
+    hard_value = BINS[jnp.clip(token, 0, 1023)]
+    # Store logits for backward pass
+    return hard_value, logits
+
+def _decode_bwd(temperature, res, g):
+    """Backward pass: use soft decode gradient.
+
+    Note: When using nondiff_argnums, the non-diff args come first in bwd.
+    """
+    logits = res
+    # Compute gradient of soft_decode w.r.t. logits
+    def soft_decode_for_grad(logits):
+        probs = jax.nn.softmax(logits / temperature, axis=-1)
+        return jnp.sum(probs * BINS, axis=-1)
+
+    _, vjp_fn = jax.vjp(soft_decode_for_grad, logits)
+    logits_grad, = vjp_fn(g)
+    return (logits_grad,)
+
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def straight_through_decode(logits, temperature=0.1):
+    """
+    Straight-through estimator for decoding.
+
+    Forward: hard argmax decode (EXACTLY matches hard simulation)
+    Backward: soft decode gradient (differentiable)
+    """
+    token = jnp.argmax(logits, axis=-1)
+    return BINS[jnp.clip(token, 0, 1023)]
+
+straight_through_decode.defvjp(_decode_fwd, _decode_bwd)
+
+
+def _encode_embed_fwd(lataccel_hist, embed_weight, temperature):
+    """Forward pass: exact hard token embedding lookup."""
+    lataccel_hist_clipped = jnp.clip(lataccel_hist, -5, 5)
+    hard_tokens = jnp.digitize(lataccel_hist_clipped, BINS, right=True)
+    hard_token_emb = embed_weight[hard_tokens]
+    # Store values needed for backward
+    return hard_token_emb, (lataccel_hist_clipped, embed_weight)
+
+def _encode_embed_bwd(temperature, res, g):
+    """Backward pass: gradient through soft embedding.
+
+    Note: When using nondiff_argnums, the non-diff args come first in bwd.
+    """
+    lataccel_hist_clipped, embed_weight = res
+
+    def soft_embed_for_grad(lataccel_hist_clipped, embed_weight):
+        # Soft encoding
+        distances = (lataccel_hist_clipped[..., None] - BINS) ** 2
+        logits = -distances / (2 * temperature ** 2)
+        soft_probs = jax.nn.softmax(logits, axis=-1)
+        # Soft embedding
+        return jnp.einsum('...v,vd->...d', soft_probs, embed_weight)
+
+    _, vjp_fn = jax.vjp(soft_embed_for_grad, lataccel_hist_clipped, embed_weight)
+    lataccel_grad, embed_grad = vjp_fn(g)
+    return (lataccel_grad, embed_grad)
+
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def straight_through_encode_embed(lataccel_hist, embed_weight, temperature=0.1):
+    """
+    Straight-through estimator for encoding + embedding lookup.
+
+    Forward: hard token lookup (EXACTLY matches hard simulation)
+    Backward: gradient flows through soft encoding
+    """
+    lataccel_hist_clipped = jnp.clip(lataccel_hist, -5, 5)
+    hard_tokens = jnp.digitize(lataccel_hist_clipped, BINS, right=True)
+    return embed_weight[hard_tokens]
+
+straight_through_encode_embed.defvjp(_encode_embed_fwd, _encode_embed_bwd)
+
+
+def make_ste_step(model, temperature=0.1):
+    """
+    Create simulation step with straight-through estimator.
+
+    Forward pass is EXACTLY the same as hard simulation.
+    Backward pass uses soft approximations for gradient flow.
+    """
+
+    def simulation_step(carry, inputs):
+        action_hist, lataccel_hist, exo_hist, current_lataccel = carry
+        exo_row, action = inputs
+
+        # Build states [batch, 20, 4]: (action, roll, v, a)
+        # This is EXACTLY the same as hard simulation
+        states = jnp.concatenate([
+            action_hist[:, :, None],
+            exo_hist,
+        ], axis=-1)
+
+        # Tokenize lataccel history - using STE for embedding
+        # Forward: hard token lookup, Backward: soft gradient
+        token_emb = straight_through_encode_embed(
+            lataccel_hist, model.token_embed.weight, temperature
+        )
+
+        # State embedding (same as hard simulation)
+        state_emb = states @ model.state_proj.weight.T + model.state_proj.bias
+
+        # Concatenate and add position (same as hard simulation)
+        B, T, _ = states.shape
+        x = jnp.concatenate([state_emb, token_emb], axis=-1)
+        x = x + model.pos_embed[:T]
+
+        # Causal mask
+        mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+
+        # Transformer blocks (same as hard simulation)
+        for block in model.blocks:
+            x = block(x, mask)
+
+        # Output (same as hard simulation)
+        def ln(x, weight, bias, eps=1e-5):
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.var(x, axis=-1, keepdims=True)
+            return (x - mean) / jnp.sqrt(var + eps) * weight + bias
+
+        x = ln(x, model.ln_f.weight, model.ln_f.bias)
+        logits = x @ model.lm_head.weight.T
+
+        # Straight-through decode: hard forward, soft backward
+        next_lataccel = straight_through_decode(logits[:, -1, :], temperature)
+
+        # Rate limit (same as hard simulation)
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update histories (same as hard simulation)
+        action_hist = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+        lataccel_hist = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist, lataccel_hist, exo_hist, next_lataccel)
+        return new_carry, next_lataccel
+
+    return simulation_step
+
+
+def run_simulation_ste(model, init_action_hist, init_lataccel_hist, init_exo_hist,
+                       exo_data, actions, temperature=0.1):
+    """
+    Run simulation with straight-through estimator.
+
+    Forward pass is EXACTLY identical to hard simulation.
+    Backward pass uses soft approximations (differentiable).
+
+    Args:
+        model: TinyPhysicsModel (frozen weights)
+        init_action_hist: [batch, 20]
+        init_lataccel_hist: [batch, 20]
+        init_exo_hist: [batch, 20, 3]
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        actions: [n_steps, batch]
+        temperature: softmax temperature for gradient computation
+
+    Returns:
+        lataccels: [n_steps, batch] - predicted lateral accelerations
+    """
+    init_carry = (init_action_hist, init_lataccel_hist, init_exo_hist, init_lataccel_hist[:, -1])
+    step_fn = make_ste_step(model, temperature=temperature)
+    _, lataccels = lax.scan(step_fn, init_carry, (exo_data, actions))
+    return lataccels
+
+
+def make_ste_pid_step(model, temperature=0.1):
+    """
+    Create simulation step with STE and PID controller.
+
+    Forward pass uses hard argmax (matches real inference).
+    Backward pass uses soft approximations for gradient flow.
+    PID params are passed in carry so they can receive gradients.
+    """
+
+    def simulation_step(carry, exo_row):
+        (action_hist, lataccel_hist, exo_hist, current_lataccel,
+         error_integral, prev_error, p, i, d) = carry
+
+        # exo_row: [batch, 4] = roll, v, a, target
+        target = exo_row[:, 3]
+
+        # PID controller - compute action FIRST (like tinyphysics.py control_step)
+        error = target - current_lataccel
+        error_integral_new = error_integral + error
+        error_derivative = error - prev_error
+        action = p * error + i * error_integral_new + d * error_derivative
+        action = jnp.clip(action, -2.0, 2.0)
+
+        # Update action history BEFORE model forward (tinyphysics.py does control_step then sim_step)
+        # The current step's action must be in the history when the model runs
+        action_hist_updated = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist_updated = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+
+        # Build states [batch, 20, 4]: (action, roll, v, a) - with CURRENT action included
+        states = jnp.concatenate([
+            action_hist_updated[:, :, None],
+            exo_hist_updated,
+        ], axis=-1)
+
+        # Tokenize lataccel history - using STE for embedding
+        token_emb = straight_through_encode_embed(
+            lataccel_hist, model.token_embed.weight, temperature
+        )
+
+        # State embedding
+        state_emb = states @ model.state_proj.weight.T + model.state_proj.bias
+
+        # Concatenate and add position
+        B, T, _ = states.shape
+        x = jnp.concatenate([state_emb, token_emb], axis=-1)
+        x = x + model.pos_embed[:T]
+
+        # Causal mask
+        mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+
+        # Transformer blocks
+        for block in model.blocks:
+            x = block(x, mask)
+
+        # Output
+        def ln(x, weight, bias, eps=1e-5):
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.var(x, axis=-1, keepdims=True)
+            return (x - mean) / jnp.sqrt(var + eps) * weight + bias
+
+        x = ln(x, model.ln_f.weight, model.ln_f.bias)
+        logits = x @ model.lm_head.weight.T
+
+        # Straight-through decode: hard forward, soft backward
+        next_lataccel = straight_through_decode(logits[:, -1, :], temperature)
+
+        # Rate limit
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update lataccel history (action/exo already updated above before model forward)
+        lataccel_hist_updated = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist_updated, lataccel_hist_updated, exo_hist_updated, next_lataccel,
+                     error_integral_new, error, p, i, d)
+
+        output = jnp.stack([next_lataccel, action, target], axis=-1)  # [batch, 3]
+        return new_carry, output
+
+    return simulation_step
+
+
+def run_simulation_ste_pid(model, init_action_hist, init_lataccel_hist, init_exo_hist,
+                           exo_data, p, i, d, init_error_integral=None, init_prev_error=None,
+                           temperature=0.1):
+    """
+    Run simulation with STE and PID controller.
+
+    Differentiable w.r.t. PID gains p, i, d.
+
+    Args:
+        model: TinyPhysicsModel
+        init_action_hist: [batch, 20]
+        init_lataccel_hist: [batch, 20]
+        init_exo_hist: [batch, 20, 3]
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        p, i, d: PID gains (scalars or arrays broadcastable to batch)
+        init_error_integral: [batch] initial accumulated error (from warmup)
+        init_prev_error: [batch] previous error (from warmup)
+        temperature: softmax temperature for STE
+
+    Returns:
+        outputs: [n_steps, batch, 3] (lataccel, action, target)
+    """
+    batch_size = init_action_hist.shape[0]
+
+    if init_error_integral is None:
+        init_error_integral = jnp.zeros(batch_size)
+    if init_prev_error is None:
+        init_prev_error = jnp.zeros(batch_size)
+
+    init_carry = (
+        init_action_hist,
+        init_lataccel_hist,
+        init_exo_hist,
+        init_lataccel_hist[:, -1],
+        init_error_integral,
+        init_prev_error,
+        p, i, d
+    )
+
+    step_fn = make_ste_pid_step(model, temperature=temperature)
+    _, outputs = jax.lax.scan(step_fn, init_carry, exo_data)
+    return outputs  # [n_steps, batch, 3]
+
+
+# ============================================================================
+# FULLY DIFFERENTIABLE SOFT PID SIMULATION
+# Uses soft encode/decode throughout - gradients match finite differences
+# ============================================================================
+
+def make_soft_pid_step(model, temperature=0.5):
+    """
+    Create fully differentiable simulation step with PID controller.
+
+    Uses soft encoding/decoding throughout so gradients are correct.
+    """
+
+    def simulation_step(carry, exo_row):
+        (action_hist, lataccel_hist, exo_hist, current_lataccel,
+         error_integral, prev_error, p, i, d) = carry
+
+        # exo_row: [batch, 4] = roll, v, a, target
+        target = exo_row[:, 3]
+
+        # PID controller
+        error = target - current_lataccel
+        error_integral_new = error_integral + error
+        error_derivative = error - prev_error
+        action = p * error + i * error_integral_new + d * error_derivative
+        action = jnp.clip(action, -2.0, 2.0)
+
+        # Update histories BEFORE model forward
+        action_hist_updated = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist_updated = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+
+        # Build states [batch, 20, 4]: (action, roll, v, a)
+        states = jnp.concatenate([
+            action_hist_updated[:, :, None],
+            exo_hist_updated,
+        ], axis=-1)
+
+        # Soft forward pass (fully differentiable)
+        logits = model_forward_soft(model, states, lataccel_hist, temperature)
+
+        # Soft decode (fully differentiable)
+        next_lataccel = soft_decode(logits[:, -1, :], temperature)
+
+        # Rate limit
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update lataccel history
+        lataccel_hist_updated = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist_updated, lataccel_hist_updated, exo_hist_updated, next_lataccel,
+                     error_integral_new, error, p, i, d)
+
+        output = jnp.stack([next_lataccel, action, target], axis=-1)
+        return new_carry, output
+
+    return simulation_step
+
+
+def run_simulation_soft_pid(model, init_action_hist, init_lataccel_hist, init_exo_hist,
+                            exo_data, p, i, d, init_error_integral=None, init_prev_error=None,
+                            temperature=0.5):
+    """
+    Run fully differentiable simulation with PID controller.
+
+    Gradients are correct (match finite differences).
+    Use for optimization, then evaluate with run_simulation_ste_pid.
+
+    Args:
+        model: TinyPhysicsModel
+        init_action_hist: [batch, 20]
+        init_lataccel_hist: [batch, 20]
+        init_exo_hist: [batch, 20, 3]
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        p, i, d: PID gains
+        init_error_integral: [batch] initial accumulated error (from warmup)
+        init_prev_error: [batch] previous error (from warmup)
+        temperature: softmax temperature (higher = smoother)
+
+    Returns:
+        outputs: [n_steps, batch, 3] (lataccel, action, target)
+    """
+    batch_size = init_action_hist.shape[0]
+
+    if init_error_integral is None:
+        init_error_integral = jnp.zeros(batch_size)
+    if init_prev_error is None:
+        init_prev_error = jnp.zeros(batch_size)
+
+    init_carry = (
+        init_action_hist,
+        init_lataccel_hist,
+        init_exo_hist,
+        init_lataccel_hist[:, -1],
+        init_error_integral,
+        init_prev_error,
+        p, i, d
+    )
+
+    step_fn = make_soft_pid_step(model, temperature=temperature)
+    _, outputs = jax.lax.scan(step_fn, init_carry, exo_data)
+    return outputs
+
+
+# ============================================================================
+# CROSS-ENTROPY PID SIMULATION
+# Uses cross-entropy loss on logits - gradients match finite differences!
+# ============================================================================
+
+def make_ce_pid_step(model, temperature=0.5):
+    """
+    Create simulation step with cross-entropy loss on logits.
+
+    Returns logits for CE loss computation, uses soft decode for recurrence.
+    """
+
+    def simulation_step(carry, exo_row):
+        (action_hist, lataccel_hist, exo_hist, current_lataccel,
+         error_integral, prev_error, p, i, d) = carry
+
+        target = exo_row[:, 3]
+
+        # PID controller
+        error = target - current_lataccel
+        error_integral_new = error_integral + error
+        error_derivative = error - prev_error
+        action = p * error + i * error_integral_new + d * error_derivative
+        action = jnp.clip(action, -2.0, 2.0)
+
+        # Update histories BEFORE model forward
+        action_hist_updated = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist_updated = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+
+        # Build states
+        states = jnp.concatenate([
+            action_hist_updated[:, :, None],
+            exo_hist_updated,
+        ], axis=-1)
+
+        # Soft forward pass
+        logits = model_forward_soft(model, states, lataccel_hist, temperature)
+
+        # Soft decode for recurrence
+        next_lataccel = soft_decode(logits[:, -1, :], temperature)
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update lataccel history
+        lataccel_hist_updated = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist_updated, lataccel_hist_updated, exo_hist_updated, next_lataccel,
+                     error_integral_new, error, p, i, d)
+
+        # Output: logits (for CE loss), soft lataccel, action, target
+        output = (logits[:, -1, :], next_lataccel, action, target)
+        return new_carry, output
+
+    return simulation_step
+
+
+def run_simulation_ce_pid(model, init_action_hist, init_lataccel_hist, init_exo_hist,
+                          exo_data, p, i, d, init_error_integral=None, init_prev_error=None,
+                          temperature=0.5):
+    """
+    Run simulation returning logits for cross-entropy loss.
+
+    Returns:
+        logits: [n_steps, batch, 1024] - raw logits for CE loss
+        lataccels: [n_steps, batch] - soft decoded values
+        actions: [n_steps, batch] - PID actions
+        targets: [n_steps, batch] - target lataccels
+    """
+    batch_size = init_action_hist.shape[0]
+
+    if init_error_integral is None:
+        init_error_integral = jnp.zeros(batch_size)
+    if init_prev_error is None:
+        init_prev_error = jnp.zeros(batch_size)
+
+    init_carry = (
+        init_action_hist,
+        init_lataccel_hist,
+        init_exo_hist,
+        init_lataccel_hist[:, -1],
+        init_error_integral,
+        init_prev_error,
+        p, i, d
+    )
+
+    step_fn = make_ce_pid_step(model, temperature=temperature)
+    _, outputs = jax.lax.scan(step_fn, init_carry, exo_data)
+
+    logits, lataccels, actions, targets = outputs
+    return logits, lataccels, actions, targets
+
+
+# ============================================================================
+# SPARSEMAX PID SIMULATION
+# Uses sparsemax for both encoding and decoding - sparse but differentiable
+# Output often matches hard argmax exactly while still having gradients
+# ============================================================================
+
+def model_forward_sparsemax(model, states, lataccel_hist):
+    """Forward pass with sparsemax token embeddings (differentiable, sparse)."""
+    B, T, _ = states.shape
+
+    # Sparsemax encode lataccel history
+    # For encoding, we use hard tokens since sparsemax encoding is expensive
+    # and the main benefit is in the decode step
+    lataccel_hist_clipped = jnp.clip(lataccel_hist, -5, 5)
+    hard_tokens = jnp.digitize(lataccel_hist_clipped, BINS, right=True)
+    token_emb = model.token_embed.weight[hard_tokens]
+
+    # State embedding
+    state_emb = states @ model.state_proj.weight.T + model.state_proj.bias
+
+    # Concatenate and add position
+    x = jnp.concatenate([state_emb, token_emb], axis=-1)
+    x = x + model.pos_embed[:T]
+
+    # Causal mask
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+
+    # Transformer blocks
+    for block in model.blocks:
+        x = block(x, mask)
+
+    # Output
+    def ln(x, weight, bias, eps=1e-5):
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
+        return (x - mean) / jnp.sqrt(var + eps) * weight + bias
+
+    x = ln(x, model.ln_f.weight, model.ln_f.bias)
+    logits = x @ model.lm_head.weight.T
+
+    return logits
+
+
+def make_sparsemax_pid_step(model):
+    """
+    Create simulation step with sparsemax decoding.
+
+    Uses hard encoding (fast) but sparsemax decoding (differentiable, often exact).
+    """
+
+    def simulation_step(carry, exo_row):
+        (action_hist, lataccel_hist, exo_hist, current_lataccel,
+         error_integral, prev_error, p, i, d) = carry
+
+        target = exo_row[:, 3]
+
+        # PID controller
+        error = target - current_lataccel
+        error_integral_new = error_integral + error
+        error_derivative = error - prev_error
+        action = p * error + i * error_integral_new + d * error_derivative
+        action = jnp.clip(action, -2.0, 2.0)
+
+        # Update histories BEFORE model forward
+        action_hist_updated = jnp.concatenate([action_hist[:, 1:], action[:, None]], axis=1)
+        exo_hist_updated = jnp.concatenate([exo_hist[:, 1:, :], exo_row[:, None, :3]], axis=1)
+
+        # Build states
+        states = jnp.concatenate([
+            action_hist_updated[:, :, None],
+            exo_hist_updated,
+        ], axis=-1)
+
+        # Forward pass (uses hard encoding for efficiency)
+        logits = model_forward_sparsemax(model, states, lataccel_hist)
+
+        # Sparsemax decode - sparse but differentiable
+        next_lataccel = sparsemax_decode(logits[:, -1, :])
+
+        # Rate limit
+        next_lataccel = jnp.clip(next_lataccel, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+
+        # Update lataccel history
+        lataccel_hist_updated = jnp.concatenate([lataccel_hist[:, 1:], next_lataccel[:, None]], axis=1)
+
+        new_carry = (action_hist_updated, lataccel_hist_updated, exo_hist_updated, next_lataccel,
+                     error_integral_new, error, p, i, d)
+
+        output = jnp.stack([next_lataccel, action, target], axis=-1)
+        return new_carry, output
+
+    return simulation_step
+
+
+def run_simulation_sparsemax_pid(model, init_action_hist, init_lataccel_hist, init_exo_hist,
+                                  exo_data, p, i, d, init_error_integral=None, init_prev_error=None):
+    """
+    Run simulation with sparsemax decoding.
+
+    Sparsemax often produces exact one-hot outputs (matching hard argmax)
+    while still being differentiable at the boundaries.
+
+    Args:
+        model: TinyPhysicsModel
+        init_action_hist: [batch, 20]
+        init_lataccel_hist: [batch, 20]
+        init_exo_hist: [batch, 20, 3]
+        exo_data: [n_steps, batch, 4] (roll, v, a, target)
+        p, i, d: PID gains
+        init_error_integral: [batch] initial accumulated error (from warmup)
+        init_prev_error: [batch] previous error (from warmup)
+
+    Returns:
+        outputs: [n_steps, batch, 3] (lataccel, action, target)
+    """
+    batch_size = init_action_hist.shape[0]
+
+    if init_error_integral is None:
+        init_error_integral = jnp.zeros(batch_size)
+    if init_prev_error is None:
+        init_prev_error = jnp.zeros(batch_size)
+
+    init_carry = (
+        init_action_hist,
+        init_lataccel_hist,
+        init_exo_hist,
+        init_lataccel_hist[:, -1],
+        init_error_integral,
+        init_prev_error,
+        p, i, d
+    )
+
+    step_fn = make_sparsemax_pid_step(model)
+    _, outputs = jax.lax.scan(step_fn, init_carry, exo_data)
     return outputs
