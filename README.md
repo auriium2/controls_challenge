@@ -69,3 +69,5 @@ python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_s
 
 Like this sort of stuff? You might want to work at comma!
 [comma.ai/jobs](https://comma.ai/jobs)
+
+I claim that it isn't necessary for the encode to be differentiable to get gradients, because the transformer can be thought of as a function of state [last 20 roll, v, a, lateral accels and *tokenized last actions*], control input of [action], and output of lateral acceleration. Since the lifting function from last actions to tokenized last actions is always known, we can do iLQR on the tokenized last action + rest of the state's state space, and use the tokenized space jacobians to feed the ilqr, and still calculate a correct optimal input. Is this correct?

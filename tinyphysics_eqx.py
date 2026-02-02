@@ -1,3 +1,4 @@
+import functools
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -9,8 +10,8 @@ import onnx.numpy_helper
 from typing import Dict, Tuple
 from functools import partial
 from jaxopt.projection import projection_simplex
-
-import common
+from jaxtyping import Float, Array
+from common import BINS, TEMPERATURE, MAX_ACC_DELTA, VELOCITY_CLIP, decode, encode
 
 class TransformerBlock(eqx.Module):
     """Single transformer block with pre-norm architecture."""
@@ -75,7 +76,7 @@ class TransformerBlock(eqx.Module):
         x = x + h
 
         return x
-class TinyPhysicsModel(eqx.Module):
+class EQXPhysicsModel(eqx.Module):
     """TinyPhysics GPT-style model."""
 
     state_proj: nn.Linear
@@ -86,18 +87,7 @@ class TinyPhysicsModel(eqx.Module):
     lm_head: nn.Linear
     context_len: int = eqx.field(static=True)
 
-    def __init__(
-        self,
-        n_layers: int = 4,
-        n_heads: int = 4,
-        d_model: int = 128,
-        d_ff: int = 512,
-        context_len: int = 20,
-        vocab_size: int = 1024,
-        state_dim: int = 4,
-        *,
-        key
-    ):
+    def __init__(self, n_layers: int = 4, n_heads: int = 4, d_model: int = 128, d_ff: int = 512, context_len: int = 20, vocab_size: int = 1024, state_dim: int = 4, *,  key):
         keys = jax.random.split(key, n_layers + 4)
         self.context_len = context_len
 
@@ -115,7 +105,6 @@ class TinyPhysicsModel(eqx.Module):
         # Output
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, use_bias=False, key=keys[-1])
-
     def __call__(self, states, tokens):
         """
         Forward pass.
@@ -154,9 +143,7 @@ class TinyPhysicsModel(eqx.Module):
         logits = x @ self.lm_head.weight.T
 
         return logits
-
-
-def load_weights_from_onnx(model: TinyPhysicsModel, onnx_path: str) -> TinyPhysicsModel:
+def load_weights_from_onnx(model: EQXPhysicsModel, onnx_path: str) -> EQXPhysicsModel:
     """Load weights from ONNX file into Equinox model."""
     onnx_model = onnx.load(onnx_path)
 
@@ -258,107 +245,29 @@ def load_weights_from_onnx(model: TinyPhysicsModel, onnx_path: str) -> TinyPhysi
     )
 
     # LM head
-    model = eqx.tree_at(
-        lambda m: m.lm_head.weight,
-        model,
-        jnp.array(weights['onnx::MatMul_570'].T)
-    )
+    model = eqx.tree_at(lambda m: m.lm_head.weight,model,jnp.array(weights['onnx::MatMul_570'].T) )
 
     return model
-
-
-def create_model(onnx_path: str) -> TinyPhysicsModel:
+def create_model(onnx_path: str) -> EQXPhysicsModel:
     """Create model and load weights from ONNX."""
     key = jax.random.PRNGKey(0)
-    model = TinyPhysicsModel(key=key)
+    model = EQXPhysicsModel(key=key)
     model = load_weights_from_onnx(model, onnx_path)
     return model
 
 
-# Tokenization
-BINS = jnp.linspace(-5, 5, 1024)
-MAX_ACC_DELTA = 0.5
-CONTEXT_LENGTH = 20
 
-def encode(value):
-    """Encode lataccel to token."""
-    value = jnp.clip(value, -5, 5)
-    return jnp.digitize(value, BINS, right=True)
+#
+type PredictorState = Tuple[Float[Array, 20], Float[Array, 20], Float[Array, 20], Float[Array, 1]]
+type PredictorExo = Float[Array, 4]
 
-def decode(token):
-    """Decode token to lataccel."""
-    return BINS[jnp.clip(token, 0, 1023)]
+def predict_raw(model: EQXPhysicsModel, state: PredictorState):
+    action_hist, lataccel_hist, exo_hist, current_lataccel = state
 
-def soft_decode(logits, temperature=1.0):
-    """Differentiable decoding: softmax weighted average of bin values.
-
-    Args:
-        logits: [batch, vocab_size] - raw logits from model
-        temperature: softmax temperature (lower = sharper, closer to argmax)
-
-    Returns:
-        [batch] - continuous lataccel values
-    """
-    probs = jax.nn.softmax(logits / temperature, axis=-1)
-    return jnp.sum(probs * BINS, axis=-1)
-
-
-def sparsemax_decode(logits, scale=10.0):
-    """Differentiable decoding using sparsemax.
-
-    Sparsemax projects onto the probability simplex, producing sparse outputs
-    that are often exactly one-hot (matching hard argmax) while still being
-    differentiable at the boundaries.
-
-    Args:
-        logits: [batch, vocab_size] - raw logits from model
-        scale: multiply logits by this factor before sparsemax (higher = sparser)
-
-    Returns:
-        [batch] - continuous lataccel values (often exactly matching hard decode)
-    """
-    # Scale logits to make sparsemax sparser (more likely to be one-hot)
-    scaled_logits = logits * scale
-    probs = jax.vmap(projection_simplex)(scaled_logits)
-    return jnp.sum(probs * BINS, axis=-1)
-
-
-def sparsemax_encode(value):
-    """Sparsemax-based soft encoding.
-
-    Creates sparse token probabilities based on distance to bins.
-    """
-    value = jnp.clip(value, -5, 5)
-    # Negative squared distance as logits
-    distances = -(value[..., None] - BINS) ** 2
-    # Apply sparsemax (projection onto simplex)
-    return jax.vmap(projection_simplex)(distances.reshape(-1, 1024)).reshape(value.shape + (1024,))
-
-
-def soft_encode(value, temperature=0.1):
-    """Differentiable encoding: soft one-hot based on distance to bins.
-
-    Creates a soft token representation that is differentiable w.r.t. value.
-    Uses a Gaussian-like kernel centered at the value's position in bin space.
-
-    Args:
-        value: [...] - continuous lataccel values
-        temperature: controls sharpness (lower = closer to hard encoding)
-
-    Returns:
-        [..., 1024] - soft token probabilities
-    """
-    value = jnp.clip(value, -5, 5)
-    # Distance from each bin
-    distances = (value[..., None] - BINS) ** 2  # [..., 1024]
-    # Soft assignment via negative squared distance
-    logits = -distances / (2 * temperature ** 2)
-    return jax.nn.softmax(logits, axis=-1)
+    pass
 
 
 def make_simulation_step(model):
-    """Create a simulation step function for use with lax.scan."""
-
     def simulation_step(carry, inputs):
         """Single simulation step.
 
@@ -600,46 +509,6 @@ def run_simulation_noisy_pid(model, init_action_hist, init_lataccel_hist, init_e
 # ============================================================================
 # DIFFERENTIABLE SIMULATION (for training surrogate models)
 # ============================================================================
-
-def model_forward_soft(model, states, lataccel_hist, temperature=0.1):
-    """Forward pass with soft token embeddings (differentiable).
-
-    Instead of using integer tokens, we compute soft embeddings by
-    weighting the token embedding matrix by soft token probabilities.
-    """
-    B, T, _ = states.shape
-
-    # Soft encode lataccel history -> [batch, seq, 1024]
-    soft_tokens = soft_encode(lataccel_hist, temperature=temperature)
-
-    # Soft token embedding: weighted sum of embedding vectors
-    # token_embed.weight: [1024, 64], soft_tokens: [batch, seq, 1024]
-    token_emb = jnp.einsum('bsv,vd->bsd', soft_tokens, model.token_embed.weight)
-
-    # State embedding
-    state_emb = states @ model.state_proj.weight.T + model.state_proj.bias
-
-    # Concatenate and add position
-    x = jnp.concatenate([state_emb, token_emb], axis=-1)
-    x = x + model.pos_embed[:T]
-
-    # Causal mask
-    mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-
-    # Transformer blocks
-    for block in model.blocks:
-        x = block(x, mask)
-
-    # Output
-    def ln(x, weight, bias, eps=1e-5):
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.var(x, axis=-1, keepdims=True)
-        return (x - mean) / jnp.sqrt(var + eps) * weight + bias
-
-    x = ln(x, model.ln_f.weight, model.ln_f.bias)
-    logits = x @ model.lm_head.weight.T
-
-    return logits
 
 
 def make_differentiable_step(model, temperature=0.1):

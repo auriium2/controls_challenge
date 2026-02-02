@@ -29,3 +29,6 @@ dependencies = [
     "torch>=2.9.0",
     "tqdm>=4.67.1",
 ]
+
+[tool.ruff.lint]
+ignore = ["F821", "F722"]
