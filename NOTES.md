@@ -1,175 +1,196 @@
-# Controls Challenge - Important Notes
+# Controls Challenge - Working Notes
 
-## Current Status (2024-12-13)
+## Project Overview
 
-We have a working offline training pipeline for the bicycle model using pre-collected trajectory data.
+Comma Controls Challenge v2: write a controller that drives a simulated car to follow a desired lateral acceleration trajectory. The simulator is a GPT-style autoregressive model (TinyPhysics) that predicts lateral acceleration given steering commands.
 
-**Latest trained model results (extended model, clean data):**
-- Loss: 0.053 (down from 58 at start)
-- Parameters:
-  - steer_ratio=0.019 (very small - steering has minimal effect)
-  - wheelbase=3.02m
-  - roll_coeff=0.88
-  - time_constant=0.33s
-  - v_steer=-0.025
-  - accel=0.019
-  - bias=-0.18
+## Architecture
 
-**Key finding:** The transformer predicts lataccel primarily from roll, not steering. The steer_ratio consistently converges to ~0.02 regardless of training setup.
+### TinyPhysics Model
+- GPT-style transformer: 4 layers, 4 heads, d_model=128, d_ff=512, context_len=20
+- Input: `states [batch, 20, 4]` = (action, roll_lataccel, v_ego, a_ego) + `tokens [batch, 20]` = tokenized lataccel history
+- Output: `logits [batch, 20, 1024]` over 1024 bins in [-5, 5]
+- Decoding: original uses sampling with temperature=0.8, seeded by md5(data_path)
+- Rate limit: `next_lataccel = clip(pred, current - 0.5, current + 0.5)`
+- Action clipped to [-2, 2] (STEER_RANGE)
 
-## The Goal
+### Tokenization
+- 1024 bins linearly spaced in [-5, 5] (`common.py: BINS`)
+- Encode: `jnp.digitize(clip(value, -5, 5), BINS, right=True)` 
+- Decode: `BINS[token]`
+- Piecewise constant - zero gradient, and that's **correct** (not a limitation)
 
-Train a differentiable bicycle model that matches the transformer's behavior. This lets us:
-1. Use the bicycle model as a fast differentiable simulator
-2. Train controllers that work on the real transformer
-3. Potentially use STE to backprop through the full system
+### Simulator Loop (tinyphysics.py)
+```
+for step in range(CONTEXT_LENGTH, len(data)):
+    1. state, target, futureplan = get_state_target_futureplan(step)
+    2. state_history.append(state)
+    3. target_lataccel_history.append(target)
+    4. control_step(): action = controller.update(...); clip to [-2,2]; action_history.append(action)
+    5. sim_step(): run model on last 20 of (action_history, state_history, lataccel_history)
+       - Before step 100: use ground truth target as current_lataccel
+       - From step 100+: use model prediction
+```
 
-## Data Format
+### Cost Function
+- `lataccel_cost = mean((target - pred)^2) * 100` (steps 100-500)
+- `jerk_cost = mean((diff(pred) / 0.1)^2) * 100` (steps 100-500)
+- `total_cost = lataccel_cost * 50 + jerk_cost`
+- Tracking weighted 50x more than jerk
 
-CSV columns: `t, vEgo, aEgo, roll, targetLateralAcceleration, steerCommand`
-
-**CRITICAL**: `steerCommand` is NaN after index 100. The first 100 steps are warmup with ground truth steering. After that, YOUR CONTROLLER provides the steering.
-
-- `CONTEXT_LENGTH = 20` - model uses 20 steps of history
-- `CONTROL_START_IDX = 100` - controller takes over at step 100
-- `COST_END_IDX = 500` - evaluation ends at step 500
-- **20,000 files available** in data/
-
-## Data Preprocessing (from tinyphysics.py)
-
+### Controller Interface
 ```python
-'roll_lataccel': np.sin(df['roll'].values) * ACC_G,  # NOT raw roll!
-'steer_command': -df['steerCommand'].values,  # NEGATED!
+class BaseController:
+    def update(self, target_lataccel, current_lataccel, state, future_plan):
+        # state: State(roll_lataccel, v_ego, a_ego)
+        # future_plan: FuturePlan(lataccel[50], roll_lataccel[50], v_ego[50], a_ego[50])
+        return action  # scalar
 ```
 
-- Roll is converted: `sin(roll) * 9.81`
-- Steer is negated (left-positive to right-positive convention)
+### Key Constants
+- CONTEXT_LENGTH = 20 (history window)
+- CONTROL_START_IDX = 100 (controller takes effect)
+- COST_END_IDX = 500 (cost computed over 100-500)
+- FUTURE_PLAN_STEPS = 50 (5 seconds at 10 FPS)
+- MAX_ACC_DELTA = 0.5 (rate limit per step)
+- DEL_T = 0.1 (timestep)
+- TEMPERATURE = 0.8
 
-## Saturation Issues - CRITICAL
+## Equinox Clone (tinyphysics_eqx.py)
 
-The system has hard limits that cause saturation:
-- `LATACCEL_RANGE = [-5, 5]` - lataccel clipped for tokenization
-- `STEER_RANGE = [-2, 2]` - actions clipped
-- `MAX_ACC_DELTA = 0.5` - rate limiting on lataccel changes
+JAX/Equinox reimplementation of the TinyPhysics model. Verified to produce **identical results** to the ONNX model:
+- Forward pass logits match to <1e-3
+- Full rollout trajectories match exactly (argmax decode)
+- Integration tested: dropping EQX into TinyPhysicsSimulator (via wrapper) produces identical costs, trajectories, and actions as ONNX (test_physics_parity.py, 17/17 tests pass)
 
-**Impact of saturation on training:**
-- Saturated data: loss = 0.118, time_constant = 0.50s
-- Clean data (no saturation): loss = 0.053, time_constant = 0.33s
-- **55% loss improvement** just by removing saturated trajectories!
+### Existing simulation functions in tinyphysics_eqx.py
+- `run_simulation()` - open-loop with given actions (argmax decode)
+- `run_simulation_pid()` - PID controller in the loop (argmax)
+- `run_simulation_ste()` - straight-through estimator (hard fwd, soft bwd)
+- `run_simulation_soft_pid()` - fully soft encode/decode (for gradient flow)
+- `run_simulation_sparsemax_pid()` - sparsemax decode
+- Various other variants for different differentiability strategies
 
-**Why saturation hurts:**
-1. Flat gradients in clipped regions
-2. Model learns incorrect dynamics (clipped values persist longer, making it think response is slower)
-3. Time constant was artificially inflated by 50% due to saturation
+## Key Insight: Differentiability for iLQR
 
-**Solution:** Filter out any trajectory where lataccel hits exactly ±5 or action hits exactly ±2.
-- Only 2.3% of trajectories saturate with varied PID gains
-- Keep 97.7% of data, get much better model
+The transformer can be viewed as: `f(states_tensor, token_embeddings) -> logits`
 
-## Other Potential Data Quality Issues to Watch
+**Encoder (lataccel -> token -> embedding):**
+- `jnp.digitize` is piecewise constant. Its true local Jacobian is zero.
+- This is **correct**, not an approximation. Small perturbations within a bin don't change the token.
+- No STE needed. Integer indexing into embedding table is naturally non-differentiable in JAX.
+- Gradients through the token/embedding path are correctly zero.
 
-1. **Rate limiting (MAX_ACC_DELTA = 0.5)**: Could also cause similar artifacts if model predictions frequently hit the rate limit
-2. **Tokenization quantization**: 1024 bins from -5 to 5 = ~0.01 resolution. Small values may be quantized away
-3. **PID gain distribution**: If certain PID gains dominate, model may overfit to those action patterns
-4. **Velocity distribution**: If training data has narrow velocity range, model may not generalize to other speeds
-5. **Roll distribution**: If roll values are correlated with steering in training data, model may learn spurious relationships
+**Decoder (logits -> lataccel):**
+- Replace argmax with expected value: `E[lataccel] = softmax(logits/T) @ BINS`
+- Naturally differentiable w.r.t. logits (and therefore w.r.t. action input)
+- Good surrogate for argmax since distributions are typically peaked
 
-## The Transformer Model
+**Clips (action [-2,2], rate limit [current-0.5, current+0.5]):**
+- Use hard `jnp.clip`. Grad=1 when unsaturated, 0 at boundary.
+- Both are correct information for iLQR. No soft clip needed.
 
-- Trained to mimic a bicycle model simulator
-- Inputs: (action, roll_lataccel, v_ego, a_ego) states + tokenized lataccel history
-- Output: logits over 1024 bins for next lataccel
-- Uses temperature=0.8 sampling in original, we use argmax for deterministic
-- Tokenization: 1024 bins from -5 to 5
+**Gradient flow path:** `action -> state_proj -> transformer -> logits -> EV decode -> next_lataccel`
+The lataccel_hist path through tokens contributes zero gradient (correct). The lataccel_hist still matters for jerk cost and rate limiter (through `current_lataccel`).
 
-## Bicycle Model Physics
+## iLQR Controller (controllers/ilqr.py)
 
-```
-lateral_accel = (v^2 / wheelbase) * steering_angle + roll_contribution
-```
+### Status: Partially working, performance issues
 
-With first-order lag dynamics. Learnable parameters:
-- `steer_ratio`: converts steer command to wheel angle (rad per unit)
-- `wheelbase`: effective wheelbase (meters)
-- `roll_coeff`: roll sensitivity multiplier
-- `time_constant`: first-order response lag (seconds)
+The iLQR controller runs and produces different actions from PID (verified output shows `u_opt[0]=-0.0816` vs `pid=0.0013`), but hangs after the first few steps. This is likely because JIT compilation of the full `ilqr_solve` (which includes `jax.jacobian` of the dynamics inside `lax.scan`) is extremely slow on first trace.
 
-Extended model adds:
-- `v_steer_coeff`: velocity modifies steering effectiveness
-- `accel_coeff`: longitudinal acceleration contribution
-- `bias`: constant offset
+### State Space (R^41)
+- `x[0:20]` = action_hist (last 20 actions)
+- `x[20:40]` = lataccel_hist (last 20 predicted lataccels)
+- `x[40]` = current_lataccel
 
-Small angle approximation used: `curvature = delta / wheelbase` instead of `tan(delta) / wheelbase`
-
-## Training Approach
-
-**Offline training (fast):**
-1. Pre-collect trajectories using `modal_collect_training_data.py` on H100 (253k samples/sec)
-2. Filter out saturated trajectories
-3. Train bicycle model on static data using `train_bicycle_offline.py`
-4. No transformer inference during training - just bicycle gradients
-
-**Data collection:**
-- Run warmup (steps 0-99) with CSV actions
-- Run PID with varied gains (p: 0.1-0.3, i: 0.05-0.15, d: -0.1 to -0.02)
-- Store: transformer_lataccels, pid_actions, init_lataccel, exo_data
-
-**Why offline is better:**
-- Transformer inference is expensive
-- Gradient only flows through bicycle (4-7 params)
-- Can use huge batch sizes (2048+)
-- 50k trajectories trains in ~2 minutes locally
-
-## STE (Straight-Through Estimator)
-
-Implemented in tinyphysics_eqx.py using `jax.custom_vjp`:
-- Forward: exact hard token decode (matches ONNX exactly)
-- Backward: soft gradient for differentiability
-
-All 112 parity tests pass. STE is available for future use (e.g., training controllers through the full system).
-
-## Key Files
-
-- `tinyphysics.py` - Original ONNX-based simulator (reference implementation)
-- `tinyphysics_eqx.py` - JAX/Equinox clone with STE support
-- `bicycle_model.py` - Physics-based bicycle dynamics (basic + extended)
-- `train_bicycle_offline.py` - Fast offline training on pre-collected data
-- `modal_collect_training_data.py` - Collect trajectory data on H100
-- `eval.py` - Evaluation script for controllers
-
-## Rollout Behavior (from tinyphysics.py)
-
+### Dynamics
 ```python
-# During warmup (step < 100):
-self.current_lataccel = self.get_state_target_futureplan(step_idx)[1]  # Use ground truth
-
-# After warmup (step >= 100):
-self.current_lataccel = pred  # Use model prediction
+def dynamics_flat(x, u, exo_hist, exo_next):
+    # Clip action, shift histories, build states tensor
+    # Call model(states, tokens) using existing EQX model.__call__
+    # EV decode: softmax(logits/T) @ BINS
+    # Rate limit clip
+    # Return flat next state [41]
 ```
 
-During warmup, lataccel history is filled with ground truth from CSV, not model predictions.
+### Jacobian Strategy
+- `jax.jacobian(dynamics_flat, argnums=(0, 1))` gives A [41,41] and B [41]
+- Single call handles everything: shifts, encode, transformer, EV decode, clips
+- Only 1 Jacobian per timestep (not 41 separate grads)
 
-## Training Infrastructure
+### Algorithm
+Standard iLQR with:
+- Forward rollout via lax.scan
+- Backward pass with Jacobians at each step, scalar Q_uu (no matrix inversion needed)
+- Line search over alphas [1.0, 0.5, 0.25, 0.1]
+- Regularization mu with adaptive updates
+- Warm start: shift previous solution
 
-- **Local:** Apple M4 Max with Metal (JAX experimental support)
-- **Remote:** Modal H100 for data collection (253k samples/sec)
-- **Data:** 20,000 CSV files, 50k pre-collected trajectories
+### Known Issues
+1. **Metal backend incompatible**: `mhlo.dot_general` legalization error when JIT-compiling Jacobians. Must use CPU (`JAX_PLATFORMS=cpu`).
+2. **JIT compilation extremely slow**: The first call triggers tracing of nested `lax.scan` with `jax.jacobian` inside. The 5 iLQR iterations x 20 horizon steps x Jacobian computation creates a massive computation graph. First 5 steps work (likely cached from trace), then hangs on recompilation or execution.
+3. **Potential fixes to explore**:
+   - Replace inner lax.scan loops with Python for-loops (eager execution, no tracing overhead)
+   - Pre-compile Jacobian function separately, cache it
+   - Reduce horizon (try H=5 or H=10)
+   - Reduce iterations (try n_iters=2)
+   - Use `jax.jacrev` on just the scalar `next_lataccel` output and construct A,B analytically from shift structure + scalar gradient (1 vjp per step instead of full 41x42 Jacobian)
 
-## Common Mistakes Made (Don't Repeat!)
+### Controller Integration
+- History bootstrapping via stack inspection on first call (gets histories from TinyPhysicsSimulator)
+- Incremental history updates on subsequent calls
+- PID fallback for NaN or exceptions
+- Warm start: shift previous solution for next call
 
-1. Using raw `roll` instead of `sin(roll) * ACC_G`
-2. Forgetting to negate steerCommand
-3. Using steerCommand after index 100 (it's NaN!)
-4. Using MLP instead of physics-based bicycle model
-5. Training on single-step transitions instead of rollouts
-6. Using `tan()` which explodes - use small angle approximation
-7. Running PID separately through bicycle (actions depend on lataccel feedback!)
-8. **Training on saturated data** - causes 55% higher loss and wrong time constant!
-9. Computing gradients through transformer (expensive and unnecessary)
+## Test Suite
+
+### tests/test_weights.py (existing, comprehensive)
+- Forward pass parity: ONNX vs EQX logits and tokens match
+- Full rollout parity: open-loop and PID, real and random actions
+- Edge cases: extreme actions, exo values, tokens
+- Tokenization: encode/decode parity and roundtrip
+- Batched operations: batched vs sequential consistency
+- PID simulation: step-by-step ONNX vs EQX PID rollout
+- STE simulation: STE forward matches hard simulation exactly
+- Against TinyPhysicsSimulator: full eval pipeline comparison
+
+### tests/test_physics_parity.py (new, integration)
+- Wraps EQX model in `EQXModelWrapper` that presents same interface as `TinyPhysicsModel`
+- Drops into `TinyPhysicsSimulator` directly - same seed, same sampling, same warmup
+- Tests: PID rollout trajectories identical, costs identical, actions identical
+- Also tests zero controller parity
+- **All 17 tests pass**
+
+## File Layout
+```
+controllers/
+  __init__.py       - BaseController
+  pid.py            - PID controller (p=0.195, i=0.100, d=-0.053)
+  zero.py           - Zero controller (always returns 0)
+  ilqr.py           - iLQR controller (WIP)
+tinyphysics.py      - Original simulator + eval pipeline (ONNX)
+tinyphysics_eqx.py  - Equinox model clone + various simulation functions
+common.py           - BINS, TEMPERATURE, MAX_ACC_DELTA, encode, decode
+tests/
+  test_weights.py          - Comprehensive ONNX vs EQX parity tests
+  test_physics_parity.py   - Integration test: full eval pipeline parity
+```
 
 ## Next Steps
 
-1. Investigate why steer_ratio → 0 (is transformer ignoring steering?)
-2. Use trained bicycle model for controller optimization
-3. Consider checking rate-limit saturation (MAX_ACC_DELTA = 0.5)
-4. Validate bicycle model on held-out trajectories
+1. **Fix iLQR performance**: The JIT compilation of the full solver is too slow. Most promising approach: replace `lax.scan` loops with Python for-loops so the Jacobian computation runs eagerly. This avoids the massive trace/compile overhead while still using JAX autodiff for each individual Jacobian call.
+
+2. **Validate iLQR correctness**: Once it runs at reasonable speed, verify that:
+   - Jacobians are correct (finite-difference check)
+   - Cost decreases across iLQR iterations
+   - Actions differ meaningfully from PID
+   - Total cost improves over PID baseline
+
+3. **Tune iLQR parameters**:
+   - Horizon (start with 10, try 20)
+   - Number of iterations (start with 3)
+   - Cost weights (w_tracking=50, w_jerk=1, w_action=0.01)
+   - Regularization schedule
+
+4. **Benchmark**: Run `eval.py` with iLQR vs PID on 100+ segments to measure improvement.

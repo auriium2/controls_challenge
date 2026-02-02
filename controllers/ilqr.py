@@ -1,3 +1,6 @@
+import os
+os.environ['JAX_PLATFORMS'] = 'cpu'
+
 from . import BaseController
 import numpy as np
 import jax
@@ -289,7 +292,7 @@ def make_ilqr_solver(model, horizon=20, n_iters=5, temperature=TEMPERATURE,
         (u_opt, _, _), _ = lax.scan(iteration, (u_init, mu_init, init_cost), None, length=n_iters)
         return u_opt
 
-    return ilqr_solve
+    return jax.jit(ilqr_solve)
 
 
 # ============================================================================
